@@ -7,11 +7,8 @@
 #include "Slave.h"
 #include "DefaultExtState.h"
 
-#define ioctl_FIONBIO(fd, mode) \
-{ \
-  int ioctl_mode=mode; \
-  ioctl(fd, FIONBIO, (char *)&ioctl_mode); \
-}
+#include "macros.h"
+
 
 #define NGTIDS 2000000
 volatile sig_atomic_t stopflag = 0;

@@ -1,5 +1,7 @@
 #!/bin/make -f
 
+.PHONY: default
+default: proxysql_binlog_reader
 
 ### NOTES:
 ### version string is fetched from git history
@@ -9,7 +11,8 @@
 ### export GIT_VERSION=2.x.y-dev
 ### ```
 
-GIT_VERSION ?= $(shell git describe --long --abbrev=7 2>/dev/null)
+#GIT_VERSION ?= $(shell git describe --long --abbrev=7 2>/dev/null)
+GIT_VERSION = 1.2.3
 ifeq ($(GIT_VERSION),)
     $(error GIT_VERSION is not set)
 endif
@@ -22,6 +25,11 @@ export GIT_VERSION
 SOURCE_DATE_EPOCH ?= $(shell git show -s --format=%ct HEAD || date +%s)
 export SOURCE_DATE_EPOCH
 
+SRCS = src/*
+PROXYSQL_BINLOG_READER_DEPS = \
+	libdaemon/libdaemon/.libs/libdaemon.a \
+	libev/.libs/libev.a \
+	libslave/libslave.a
 
 # include paths
 IDIRS :=	-I./libslave \
@@ -32,10 +40,7 @@ IDIRS :=	-I./libslave \
 LDIRS :=	-L/usr/lib64/mysql
 
 # link archives
-DEPS :=		./libslave/libslave.a \
-			./libev/.libs/libev.a \
-			./libdaemon/libdaemon/.libs/libdaemon.a
-
+DEPS :=		$(PROXYSQL_BINLOG_READER_DEPS)
 
 # build targets
 
@@ -43,8 +48,8 @@ DEPS :=		./libslave/libslave.a \
 default: proxysql_binlog_reader
 
 
-proxysql_binlog_reader: libev libdaemon libslave
-	@$(CXX) -o proxysql_binlog_reader proxysql_binlog_reader.cpp -std=c++11 -DGITVERSION=\"$(GIT_VERSION)\" -ggdb $(DEPS) $(IDIRS) $(LDIRS) -rdynamic -lz -ldl -lssl -lcrypto -lpthread -lboost_system -lrt -Wl,-Bstatic -lmysqlclient -Wl,-Bdynamic -ldl -lssl -lcrypto -pthread
+proxysql_binlog_reader: $(SRCS) libev libdaemon libslave
+	@$(CXX) -o proxysql_binlog_reader $(SRCS) -std=c++11 -DGITVERSION=\"$(GIT_VERSION)\" -ggdb $(DEPS) $(IDIRS) $(LDIRS) -rdynamic -lz -ldl -lssl -lcrypto -lpthread -lboost_system -lrt -Wl,-Bstatic -lmysqlclient -Wl,-Bdynamic -ldl -lssl -lcrypto -pthread
 # -lperconaserverclient if compiled with percona server
 
 libev/.libs/libev.a:

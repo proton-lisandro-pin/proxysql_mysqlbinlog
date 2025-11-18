@@ -23,38 +23,16 @@
 #include <libdaemon/dpid.h>
 #include <libdaemon/dexec.h>
 
-
 #include "Slave.h"
 #include "DefaultExtState.h"
 
+#include "globals.h"
+#include "gtid.h"
+#include "log.h"
+#include "macros.h"
+#include "wire_format.h"
+
 #define BINLOG_VERSION GITVERSION
-
-#define ioctl_FIONBIO(fd, mode) \
-{ \
-  int ioctl_mode=mode; \
-  ioctl(fd, FIONBIO, (char *)&ioctl_mode); \
-}
-
-void proxy_log_func(const char *fmt, ...) {
-	va_list ap;
-	va_start(ap, fmt);
-	vfprintf(stderr, fmt, ap);
-	va_end(ap);
-};
-
-#define proxy_log(level, fmt, ...) \
-	do { \
-		time_t __timer; \
-		char __buffer[25]; \
-		struct tm *__tm_info; \
-		time(&__timer); \
-		__tm_info = localtime(&__timer); \
-		strftime(__buffer, 25, "%Y-%m-%d %H:%M:%S", __tm_info); \
-		proxy_log_func("%s [" level "] " fmt , __buffer , ## __VA_ARGS__); \
-	} while(0);
-
-#define proxy_info(fmt, ...)   proxy_log("INFO", fmt, ## __VA_ARGS__);
-#define proxy_error(fmt, ...)  proxy_log("ERROR", fmt, ## __VA_ARGS__);
 
 #define NETBUFLEN                        256
 #define WRITE_CHUNKLEN                   4096
@@ -73,8 +51,6 @@ pthread_mutex_t pos_mutex;
 std::vector<char *> server_uuids;
 std::vector<uint64_t> trx_ids;
 
-std::string gtid_executed_to_string(slave::Position &curpos);
-
 static struct ev_loop *loop;
 
 volatile sig_atomic_t stopflag = 0;
@@ -87,13 +63,6 @@ int pipefd[2];
 char last_server_uuid[256];
 uint64_t last_trx_id = 0;
 
-// Global arguments
-char *errorlog = NULL;
-bool foreground = false;
-unsigned int listen_port = DEFAULT_LISTEN_PORT;
-size_t max_netbuflen = 0;
-uint64_t update_freq_ms = 0;
-
 static const char * proxysql_binlog_pid_file() {
 	static char fn[512];
 	snprintf(fn, sizeof(fn), "%s", daemon_pid_file_ident);
@@ -101,17 +70,17 @@ static const char * proxysql_binlog_pid_file() {
 }
 
 void flush_error_log() {
-	if (foreground==false) {
+	if (arg_foreground==false) {
 		int outfd=0;
 		int errfd=0;
-		outfd=open(errorlog, O_WRONLY | O_APPEND | O_CREAT , S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
+		outfd=open(arg_errorlog, O_WRONLY | O_APPEND | O_CREAT , S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
 		if (outfd>0) {
 			dup2(outfd, STDOUT_FILENO);
 			close(outfd);
 		} else {
 			fprintf(stderr,"Impossible to open file\n");
 		}
-		errfd=open(errorlog, O_WRONLY | O_APPEND | O_CREAT , S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
+		errfd=open(arg_errorlog, O_WRONLY | O_APPEND | O_CREAT , S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
 		if (errfd>0) {
 			dup2(errfd, STDERR_FILENO);
 			close(errfd);
@@ -169,17 +138,17 @@ bool daemonize_phase2() {
 }
 
 void parent_open_error_log() {
-	if (foreground==false) {
+	if (arg_foreground==false) {
 		int outfd=0;
 		int errfd=0;
-		outfd=open(errorlog, O_WRONLY | O_APPEND | O_CREAT , S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
+		outfd=open(arg_errorlog, O_WRONLY | O_APPEND | O_CREAT , S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
 		if (outfd>0) {
 			dup2(outfd, STDOUT_FILENO);
 			close(outfd);
 		} else {
 			fprintf(stderr,"Impossible to open file\n");
 		}
-		errfd=open(errorlog, O_WRONLY | O_APPEND | O_CREAT , S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
+		errfd=open(arg_errorlog, O_WRONLY | O_APPEND | O_CREAT , S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
 		if (errfd>0) {
 			dup2(errfd, STDERR_FILENO);
 			close(errfd);
@@ -191,7 +160,7 @@ void parent_open_error_log() {
 
 
 void parent_close_error_log() {
-	if (foreground==false) {
+	if (arg_foreground==false) {
 		close(STDOUT_FILENO);
 		close(STDERR_FILENO);
 	}
@@ -209,7 +178,7 @@ bool daemonize_phase3() {
 	if (rc==-1) {
 		parent_open_error_log();
 		perror("waitpid");
-		//proxy_error("[FATAL]: waitpid: %s\n", perror("waitpid"));
+		//log_error("[FATAL]: waitpid: %s", perror("waitpid"));
 		exit(EXIT_FAILURE);
 	}
 	rc=WIFEXITED(status);
@@ -329,7 +298,7 @@ class Client_Data {
 					(rc==0) ||
 					(rc==-1 && myerr != EINTR && myerr != EAGAIN)
 				) {
-					proxy_error("failed to write %d/%d bytes to client FD %d, error %d", chunk, len-pos, w->fd, errno);
+					log_error("failed to write %d/%d bytes to client FD %d, error %d", chunk, len-pos, w->fd, errno);
 					ret = false;
 					break;
 				}
@@ -359,7 +328,7 @@ void read_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
 	std::vector<struct ev_io *>::iterator it;
 	it = std::find(Clients.begin(), Clients.end(), watcher);
 	if (it != Clients.end()) {
-		//proxy_info("Remove client with FD %d\n", watcher->fd);
+		//log_info("Remove client with FD %d", watcher->fd);
 		Clients.erase(it);
 	}
 	if(EV_ERROR & revents) {
@@ -428,14 +397,13 @@ void accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
 	ev_io_init(client, read_cb, client_sd, EV_READ);
 	ev_io_start(loop, client);
 	pthread_mutex_lock(&pos_mutex);
-	std::string s1 = gtid_executed_to_string(curpos);
+	custom_data->add_string(wiremsg_st(curpos));
 	pthread_mutex_unlock(&pos_mutex);
-	custom_data->add_string("ST=" + s1 + "\n");
 	if (custom_data->writeout()) {
-		//proxy_info("Adding client with FD %d\n", client->fd);
+		//log_info("Adding client with FD %d", client->fd);
 		Clients.push_back(client);
 	} else {
-		proxy_error("Error accepting client with FD %d\n", client->fd);
+		log_error("Error accepting client with FD %d", client->fd);
 		delete custom_data;
 		free(client);
 	}
@@ -450,9 +418,9 @@ void write_clients() {
 		for (std::vector<char *>::size_type i=0; i<server_uuids.size(); i++) {
 			if (custom_data->uuid_server[0]==0 || strncmp(custom_data->uuid_server, server_uuids.at(i), strlen(server_uuids.at(i)))) {
 				strcpy(custom_data->uuid_server,server_uuids.at(i));
-				custom_data->add_string("I1=" + std::string(server_uuids.at(i)) + ":" + std::to_string(trx_ids.at(i)) + "\n");
+				custom_data->add_string(wiremsg_i1(std::string(server_uuids.at(i)), trx_ids.at(i)));
 			} else {
-				custom_data->add_string("I2=" + std::to_string(trx_ids.at(i)) + "\n");
+				custom_data->add_string(wiremsg_i2(trx_ids.at(i)));
 			}
 		}
 		if (!custom_data->writeout()) {
@@ -460,8 +428,8 @@ void write_clients() {
 			to_remove.push_back(w);
 		} else {
 			// Close connection if the write queue grows too big.
-			if (custom_data->size > max_netbuflen) {
-				proxy_error("network write buffer grew too big (%zu/%zu bytes, max %zu)", custom_data->size, custom_data->max_len, max_netbuflen);
+			if (custom_data->size > arg_max_netbuflen) {
+				log_error("network write buffer grew too big (%zu/%zu bytes, max %zu)", custom_data->size, custom_data->max_len, arg_max_netbuflen);
 				ev_io_stop(loop,w);
 				shutdown(w->fd,SHUT_RDWR);
 				close(w->fd);
@@ -502,9 +470,9 @@ static void sigint_cb (struct ev_loop *loop, ev_signal *w, int revents) {
 	stopflag = 1;
 	sl->close_connection();
 	//std::cout << " Received signal. Stopping at:" << std::endl;
-	std::string s1 = gtid_executed_to_string(curpos);
+	std::string s1 = gtid_to_string(curpos);
 	//std::cout << s1 << std::endl;
-	proxy_info("Received signal. Stopping at: %s\n", s1.c_str());
+	log_info("Received signal. Stopping at: %s", s1.c_str());
 	ev_break(loop, EVBREAK_ALL);
 }
 
@@ -546,9 +514,9 @@ class GTID_Server_Dumper {
 		}
 		ev_io_init(&ev_accept, accept_cb, sd, EV_READ);
 		ev_io_start(my_loop, &ev_accept);
-		if (update_freq_ms) {
-			proxy_info("Pushing updates every %lums\n", update_freq_ms);
-			ev_timer_init(&timer, timer_cb, update_freq_ms / 1000.0, update_freq_ms / 1000.0);
+		if (arg_update_freq_ms) {
+			log_info("Pushing updates every %lums", arg_update_freq_ms);
+			ev_timer_init(&timer, timer_cb, arg_update_freq_ms / 1000.0, arg_update_freq_ms / 1000.0);
 			ev_timer_start(my_loop, &timer);
 		} else {
 			ev_async_init(&async, async_cb);
@@ -586,37 +554,13 @@ void bench_xid_callback(unsigned int server_id) {
 	trx_ids.push_back(trx_id);
 	curpos.addGtid(sl->gtid_next);
 	pthread_mutex_unlock(&pos_mutex);
-	if (!update_freq_ms) {
+	if (!arg_update_freq_ms) {
 		ev_async_send(loop, &async);
 	}
 }
 
 bool isStopping() {
 	return stopflag;
-}
-
-std::string gtid_executed_to_string(slave::Position &curpos) {
-	std::string gtid_set { "" };
-	for (auto it=curpos.gtid_executed.begin(); it!=curpos.gtid_executed.end(); ++it) {
-		std::string s = it->first;
-		s.insert(8,"-");
-		s.insert(13,"-");
-		s.insert(18,"-");
-		s.insert(23,"-");
-		s = s + ":";
-		for (auto itr = it->second.begin(); itr != it->second.end(); ++itr) {
-			std::string s2 = s;
-			s2 = s2 + std::to_string(itr->first);
-			s2 = s2 + "-";
-			s2 = s2 + std::to_string(itr->second);
-			s2 = s2 + ",";
-			gtid_set = gtid_set + s2;
-		}
-	}
-	if (gtid_set.empty() == false) {
-		gtid_set.pop_back();
-	}
-	return gtid_set;
 }
 
 void usage(const char* name) {
@@ -641,7 +585,7 @@ void usage(const char* name) {
 }
 
 void * server(void *args) {
-	GTID_Server_Dumper * serv_dump = new GTID_Server_Dumper(listen_port);
+	GTID_Server_Dumper * serv_dump = new GTID_Server_Dumper(arg_listen_port);
 	return NULL;
 }
 
@@ -651,14 +595,16 @@ int main(int argc, char** argv) {
 	std::string password;
 	std::string errorstr;
 	unsigned int port = DEFAULT_MYSQL_PORT;
-
 	bool error = false;
+
+	arg_listen_port = DEFAULT_LISTEN_PORT;
+	arg_errorlog = (char *)DEFAULT_ERRORLOG;
 
 	int c;
 	while (-1 != (c = ::getopt(argc, argv, "vfB:t:h:u:p:P:l:L:"))) {
 		switch (c) {
-			case 'B': max_netbuflen = size_t(std::stoi(optarg)); break;
-			case 'f': foreground=true; break;
+			case 'B': arg_max_netbuflen = size_t(std::stoi(optarg)); break;
+			case 'f': arg_foreground = true; break;
 			case 'h': host = optarg; break;
 			case 'u': user = optarg; break;
 			case 'p':
@@ -666,9 +612,9 @@ int main(int argc, char** argv) {
 				memset(optarg,'x',strlen(optarg));
 				break;
 			case 'P': port = std::stoi(optarg); break;
-			case 'l': listen_port = std::stoi(optarg); break;
+			case 'l': arg_listen_port = std::stoi(optarg); break;
 			case 'L': errorstr = optarg; break;
-			case 't': update_freq_ms = std::stoi(optarg); break;
+			case 't': arg_update_freq_ms = std::stoi(optarg); break;
 			case 'v':
 				std::cout << "proxysql_binlog_reader version " << BINLOG_VERSION << std::endl;
 				return 1;
@@ -678,13 +624,11 @@ int main(int argc, char** argv) {
 		}
 	}
 
-	if (errorstr.empty()) {
-		errorlog = (char *)DEFAULT_ERRORLOG;
-	} else {
-		errorlog = strdup(errorstr.c_str());
+	if (!errorstr.empty()) {
+		arg_errorlog = (char *)DEFAULT_ERRORLOG;
 	}
-	if (!max_netbuflen) {
-		max_netbuflen = size_t(update_freq_ms ? DEFAULT_MAX_NETBUFLEN_STREAMING : DEFAULT_MAX_NETBUFLEN_BATCHED);
+	if (!arg_max_netbuflen) {
+		arg_max_netbuflen = size_t(arg_update_freq_ms ? DEFAULT_MAX_NETBUFLEN_STREAMING : DEFAULT_MAX_NETBUFLEN_BATCHED);
 	}
 
 	if (host.empty() || user.empty())
@@ -698,7 +642,7 @@ int main(int argc, char** argv) {
 	}
 
 
-	if (foreground==false) {
+	if (arg_foreground==false) {
 	daemonize_phase1((char *)argv[0]);
 	if ((pid = daemon_fork()) < 0) {
 			/* Exit on error */
@@ -771,7 +715,7 @@ __start_label:
 	masterinfo.conn_options.mysql_pass = password;
 
 	try {
-		proxy_info("proxysql_binlog_reader version %s\n", BINLOG_VERSION);
+		log_info("proxysql_binlog_reader version %s", BINLOG_VERSION);
 
 		slave::DefaultExtState sDefExtState;
 		slave::Slave slave(masterinfo, sDefExtState);
@@ -780,23 +724,23 @@ __start_label:
 		slave.setXidCallback(bench_xid_callback);
 
 		//std::cout << "Initializing client..." << std::endl;
-		proxy_info("Initializing client...\n");
+		log_info("Initializing client...");
 		slave.init();
 		// enable GTID
 		slave.enableGtid();
 
 		curpos = slave.getLastBinlogPos();
-		std::string s1 = gtid_executed_to_string(curpos);
+		std::string s1 = gtid_to_string(curpos);
 
 		// Wait until a valid 'GTID' has been executed for requesting binlog
 		while (s1.empty() && !isStopping()) {
-			proxy_info("'Executed_Gtid_Set' found empty, retrying...\n");
+			log_info("'Executed_Gtid_Set' found empty, retrying...");
 			usleep(1000 * 1000);
 
 			curpos = slave.getLastBinlogPos();
-			s1 = gtid_executed_to_string(curpos);
+			s1 = gtid_to_string(curpos);
 		}
-		proxy_info("Last executed GTID: '%s'\n", s1.c_str());
+		log_info("Last executed GTID: '%s'", s1.c_str());
 
 		sDefExtState.setMasterPosition(curpos);
 
@@ -805,7 +749,7 @@ __start_label:
 
 		try {
 
-			proxy_info("Reading binlogs...\n");
+			log_info("Reading binlogs...");
 			slave.get_remote_binlog([&] ()
 				{
 					const slave::MasterInfo& sMasterInfo = slave.masterInfo();
@@ -826,7 +770,7 @@ __start_label:
 }
 
 finish:
-	proxy_info("Exiting...\n");
+	log_info("Exiting...");
 	daemon_retval_send(255);
 	daemon_signal_done();
 	daemon_pid_file_remove();

@@ -22,15 +22,11 @@
 #include <libdaemon/dpid.h>
 #include <libdaemon/dexec.h>
 
-
 #include "Slave.h"
 #include "DefaultExtState.h"
 
-#define ioctl_FIONBIO(fd, mode) \
-{ \
-  int ioctl_mode=mode; \
-  ioctl(fd, FIONBIO, (char *)&ioctl_mode); \
-}
+#include "macros.h"
+
 
 unsigned int listen_port = 6020;
 struct ev_async async;
